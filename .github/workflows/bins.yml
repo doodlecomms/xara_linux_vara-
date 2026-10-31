@@ -1,0 +1,47 @@
+name: Binaries
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf]
+    steps:
+      - run: |
+          apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@v4
+      - run: scripts/release_deps.sh '${{ matrix.target }}'
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: scripts/release_bins.sh '${{ matrix.target }}'
+      - name: run the shipped binaries
+        run: |
+          case '${{ matrix.target }}' in
+          aarch64-*) q=qemu-aarch64 ;;
+          armv7-*) q=qemu-arm ;;
+          *) q= ;;
+          esac
+          if [ -n "$q" ]; then apt-get install -y --no-install-recommends qemu-user; fi
+          mkdir smoke
+          tar -C smoke -xJf target/dist/*.tar.xz
+          $q smoke/*/xara --version
+          $q smoke/*/xara-monitor --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.target }}
+          path: |
+            target/dist/*.tar.xz
+            target/dist/*.buildinfo
+          if-no-files-found: error

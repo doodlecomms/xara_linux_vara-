@@ -309,7 +309,7 @@ impl TxFront for Station {
                 self.drain_at(end);
             }
             Kind::Session => {
-                self.c.session.on_tx_done(heard);
+                self.c.session.on_tx_done(heard + self.c.opts.ptt_tail);
                 self.drain_at(end);
             }
             Kind::Announce | Kind::Fragment { .. } => {}

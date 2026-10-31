@@ -1,6 +1,6 @@
 # xara
 
-a VARA-compatible modem for linux. tested against VARA HF 4.9.0 and FM 4.4.0.
+a VARA-compatible modem for linux, freebsd and macOS. tested against VARA HF 4.9.0 and FM 4.4.0.
 
 ## minimum config
 
@@ -22,7 +22,7 @@ to transmit, add `--radio` and `--ptt` flags.
 
 ## building
 
-install deps:
+install deps (debian/ubuntu):
 
     apt install libpulse-dev libasound2-dev
 
@@ -35,13 +35,34 @@ alternatively for a local setup you can do:
     cargo build --release
     cargo test
 
+the systemd, udev and sysusers files and `dist/install.sh` are linux-only.
+
+### reproducing a release
+
+release tarballs are reproducible. rebuild one in an `ubuntu:22.04`
+container on x86_64:
+
+    # uncomment one of these:
+    TARGET=x86_64-unknown-linux-gnu
+    # TARGET=aarch64-unknown-linux-gnu
+    # TARGET=armv7-unknown-linux-gnueabihf
+
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+    git clone -b vVERSION https://github.com/x0rro/xara && cd xara
+    scripts/release_deps.sh $TARGET
+    . ~/.cargo/env
+    scripts/release_bins.sh $TARGET
+    scripts/release_tarball.sh HEAD
+    sha256sum target/dist/*.tar.xz
+
 ## options
 
     --config FILE           read key = value options from FILE
 
     --call CALL             your callsign (required)
 
-    --audio pulse|alsa      pulse vs alsa audio path
+    --audio BACKEND         pulse, alsa or coreaudio; default pulse on linux/bsd and coreaudio on macOS
+    --list-devices          list capture and playback devices for --audio
     --capture SOURCE        audio source
     --playback SINK         audio sink
     --tx-buffer-ms N        TX audio queue, raise on underruns (30-500, default 40)
@@ -70,7 +91,7 @@ alternatively for a local setup you can do:
     --digi CALL             FM digipeat for CALL (default: off)
     --record PATH           record rx, tx and PTT to FLAC (or WAV if .wav)
     --log FILE              append UTC-timestamped output to FILE
-    --quiet                 no output
+    --quiet                 only output warnings and errors
     --version and --help    guess
 
 ## PTT settings
@@ -94,6 +115,7 @@ summary of settings:
     --ptt rts:DEV               key serial port on rts, hold dtr low
     --ptt dtr:DEV               key serial port on dtr, hold rts low
     --ptt cm108:DEV[:GPIO]      cm108/cm119 HID GPIO (default GPIO: 3)
+    --ptt cm108:VID:PID[:GPIO]  cm108/cm119 by hex USB id (stable across boots)
     --ptt rigctld[:HOST:PORT]   hamlib rigctld CAT on HOST:PORT
 
     --ptt-lead-ms N             PTT held for N ms before xmit (default: 0)
@@ -113,7 +135,7 @@ options:
     --wav FILE              load from a wav file
     --stdin RATE            s16le mono at RATE Hz
 
-    --audio pulse|alsa      pulse or alsa audio path
+    --audio BACKEND         pulse, alsa or coreaudio; default coreaudio on macOS, else pulse
     --capture SOURCE        audio source
 
     --hf 500|2300|2750      HF bandwidth (default 2300)
@@ -141,4 +163,5 @@ registered copy of VARA, then run with `xara --registered ...`.
 ## copyright
 
 copyright (c) 2026 x0rro
+
 released under MIT license, see LICENSE

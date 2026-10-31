@@ -7,7 +7,7 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use super::ratematch::{self, Queue, TxBuffer};
-use super::{Audio, BLOCK, DeviceList, IO_TIMEOUT, RATE, capture_only, quantize, remaining, sample};
+use super::{Audio, BLOCK, DeviceList, IO_TIMEOUT, Path, RATE, Report, capture_only, quantize, remaining, sample};
 
 type Frames = sys::snd_pcm_uframes_t;
 
@@ -16,7 +16,6 @@ const CAPTURE_BUFFER: Frames = RATE as Frames;
 const PLAYBACK_START: Frames = 2 * PERIOD;
 const DEPTH: usize = 16;
 const WALK_DEPTH: usize = 64;
-const REPORT: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(50);
 
 const SERVERS: [&str; 4] = ["default", "pulse", "pipewire", "jack"];
@@ -46,12 +45,21 @@ const PASS: [&str; 18] = [
 enum Def {
     Name(String),
     Plugin { kind: String, slave: Option<Box<Def>> },
+    Oss(String),
+}
+
+fn oss_unit(dev: &str) -> bool {
+    dev.strip_prefix("/dev/dsp").is_some_and(|u| {
+        let (unit, sub) = u.split_once('.').unwrap_or((u, "0"));
+        [unit, sub].iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
     Card,
     Null,
+    Oss,
 }
 
 fn name_problem(name: &str) -> Option<String> {
@@ -72,6 +80,7 @@ fn follow(
     def: &Def,
     top: &str,
     depth: usize,
+    oss: bool,
 ) -> Result<Route, String> {
     if depth > DEPTH {
         return Err(format!("{top}: ALSA definition nested too deeply"));
@@ -83,11 +92,16 @@ fn follow(
                 return Err(format!("refusing ALSA playback to {top:?}: {via}{why}"));
             }
             let d = lookup(n)?;
-            follow(lookup, &d, top, depth + 1)
+            follow(lookup, &d, top, depth + 1, oss)
         }
         Def::Plugin { kind, .. } if kind == "hw" => Ok(Route::Card),
         Def::Plugin { kind, .. } if kind == "null" => Ok(Route::Null),
-        Def::Plugin { kind, slave: Some(s) } if PASS.contains(&kind.as_str()) => follow(lookup, s, top, depth + 1),
+        Def::Oss(d) if !oss => {
+            Err(format!("refusing ALSA playback to {top:?}: alsa-oss opens {d:?}, and oss is only allowed on FreeBSD"))
+        }
+        Def::Oss(d) if oss_unit(d) => Ok(Route::Oss),
+        Def::Oss(d) => Err(format!("refusing ALSA playback to {top:?}: alsa-oss plugin opens {d:?}, use /dev/dspN")),
+        Def::Plugin { kind, slave: Some(s) } if PASS.contains(&kind.as_str()) => follow(lookup, s, top, depth + 1, oss),
         Def::Plugin { kind, .. } => Err(format!(
             "refusing ALSA playback to {top:?}: it goes through a {kind:?} plugin; only ALSA's own plugins \
              in front of a hw card are allowed (sound servers can route anywhere)"
@@ -99,9 +113,10 @@ fn check_playback(
     lookup: &mut dyn FnMut(&str) -> Result<Def, String>,
     name: &str,
     radio: bool,
+    oss: bool,
 ) -> Result<Route, String> {
     if radio {
-        return follow(lookup, &Def::Name(name.into()), name, 0);
+        return follow(lookup, &Def::Name(name.into()), name, 0, oss);
     }
     let refuse = || {
         format!(
@@ -217,6 +232,13 @@ impl Config {
             return Ok(Def::Name(s));
         }
         let kind = n.child("type").and_then(Cfg::string).ok_or_else(|| format!("ALSA PCM {at:?} has no type"))?;
+        if kind == "oss" {
+            let device = match n.child("device") {
+                None => "/dev/dsp".into(),
+                Some(d) => d.string().ok_or_else(|| format!("ALSA PCM {at:?}: oss device is not a string"))?,
+            };
+            return Ok(Def::Oss(device));
+        }
         let key = if kind == "asym" { "playback" } else { "slave" };
         let slave = match n.child(key) {
             Some(s) if PASS.contains(&kind.as_str()) => Some(Box::new(self.slave(s, at)?)),
@@ -281,7 +303,7 @@ impl Config {
 
     fn resolve_playback(&self, name: &str, radio: bool) -> io::Result<Route> {
         self.check_device(name, "playback")?;
-        check_playback(&mut |n| self.pcm(n), name, radio).map_err(io::Error::other)
+        check_playback(&mut |n| self.pcm(n), name, radio, cfg!(target_os = "freebsd")).map_err(io::Error::other)
     }
 }
 
@@ -484,6 +506,13 @@ impl Handle {
         check("snd_pcm_avail", unsafe { sys::snd_pcm_avail(self.0) }).map(|n| n as usize)
     }
 
+    fn avail_delay(&self) -> Result<(usize, usize), Error> {
+        let (mut avail, mut delay): (sys::snd_pcm_sframes_t, sys::snd_pcm_sframes_t) = (0, 0);
+        // SAFETY: self.0 is open until Drop and both out pointers are valid.
+        check("snd_pcm_avail_delay", unsafe { sys::snd_pcm_avail_delay(self.0, &mut avail, &mut delay) })?;
+        Ok((avail.max(0) as usize, delay.max(0) as usize))
+    }
+
     fn delay(&self) -> Result<usize, Error> {
         let mut n: sys::snd_pcm_sframes_t = 0;
         // SAFETY: self.0 is open until Drop and n is a valid out pointer.
@@ -515,7 +544,7 @@ struct Pcm {
     buffer: usize,
     buf: Vec<u8>,
     xruns: u64,
-    reported: Option<Instant>,
+    report: Report,
 }
 
 impl Pcm {
@@ -533,7 +562,7 @@ impl Pcm {
             buffer: 0,
             buf: Vec::new(),
             xruns: 0,
-            reported: None,
+            report: Report::default(),
         })
     }
 
@@ -648,9 +677,9 @@ impl Pcm {
             let _ = self.pcm.start();
         }
         self.xruns += 1;
-        if self.reported.is_none_or(|t| t.elapsed() >= REPORT) {
-            self.reported = Some(Instant::now());
+        if self.report.due(self.xruns) {
             let kind = match (err.errno, self.dir) {
+                #[cfg(target_os = "linux")]
                 (libc::ESTRPIPE, _) => "suspended",
                 (_, Direction::Playback) => "underrun",
                 _ => "overrun",
@@ -667,7 +696,10 @@ impl Pcm {
         }
         let errno = match self.pcm.state() {
             sys::SND_PCM_STATE_XRUN => libc::EPIPE,
+            #[cfg(target_os = "linux")]
             sys::SND_PCM_STATE_SUSPENDED => libc::ESTRPIPE,
+            #[cfg(not(target_os = "linux"))]
+            sys::SND_PCM_STATE_SUSPENDED => libc::EPIPE,
             sys::SND_PCM_STATE_DISCONNECTED => libc::ENODEV,
             _ => return Ok(()),
         };
@@ -713,6 +745,7 @@ fn short_buffer(name: &str, granted: usize, tx: TxBuffer) -> Option<String> {
 pub struct AlsaIo {
     rec: Pcm,
     play: Option<Pcm>,
+    avail: Option<usize>,
 }
 
 impl AlsaIo {
@@ -732,13 +765,13 @@ impl AlsaIo {
             return Err(io::Error::other(e));
         }
         rec.setup(CAPTURE_BUFFER)?;
-        Ok(Self { rec, play: Some(play) })
+        Ok(Self { rec, play: Some(play), avail: None })
     }
 
     pub fn open_capture(capture: &str) -> io::Result<Self> {
         let mut rec = Pcm::open(&Config::load()?, capture, Direction::Capture)?;
         rec.setup(CAPTURE_BUFFER)?;
-        Ok(Self { rec, play: None })
+        Ok(Self { rec, play: None, avail: None })
     }
 }
 
@@ -796,7 +829,14 @@ impl Audio for AlsaIo {
     }
 
     fn backlog(&mut self) -> io::Result<Option<usize>> {
-        Ok(self.rec.pcm.avail().ok())
+        self.avail = self.rec.pcm.avail().ok();
+        Ok(self.avail)
+    }
+
+    fn path(&mut self) -> io::Result<Path> {
+        let seen = self.avail.take();
+        let capture = self.rec.pcm.avail_delay().ok().map(|(avail, delay)| delay.saturating_sub(seen.unwrap_or(avail)));
+        Ok(Path { capture, queue: true, ..Path::default() })
     }
 }
 
@@ -845,12 +885,24 @@ mod tests {
             ("multi", plugin("multi", None)),
             ("dangling", plugin("plug", None)),
             ("loop", name("loop")),
+            ("oss_unit", plugin("plug", Some(Def::Oss("/dev/dsp5".into())))),
+            ("oss_sub", Def::Oss("/dev/dsp5.0".into())),
+            ("oss_alias", name("oss_sub")),
+            ("oss_bare", plugin("plug", Some(Def::Oss("/dev/dsp".into())))),
+            ("oss_odd", Def::Oss("/dev/dsp5x".into())),
+            ("oss_dot", Def::Oss("/dev/dsp5.".into())),
+            ("oss_nounit", Def::Oss("/dev/dsp.0".into())),
+            ("oss_other", Def::Oss("/dev/audio0".into())),
         ])
     }
 
-    fn check(n: &str, radio: bool) -> Result<Route, String> {
+    fn check_on(n: &str, radio: bool, oss: bool) -> Result<Route, String> {
         let t = table();
-        check_playback(&mut |k| t.get(k).cloned().ok_or_else(|| format!("no ALSA pcm named {k:?}")), n, radio)
+        check_playback(&mut |k| t.get(k).cloned().ok_or_else(|| format!("no ALSA pcm named {k:?}")), n, radio, oss)
+    }
+
+    fn check(n: &str, radio: bool) -> Result<Route, String> {
+        check_on(n, radio, true)
     }
 
     #[test]
@@ -860,7 +912,7 @@ mod tests {
             assert!(check(n, false).unwrap_err().contains("needs --radio"), "{n}");
         }
         let t = HashMap::from([("null", plugin("plug", Some(name("hw:1,0"))))]);
-        assert!(check_playback(&mut |k| t.get(k).cloned().ok_or_else(String::new), "null", false).is_err());
+        assert!(check_playback(&mut |k| t.get(k).cloned().ok_or_else(String::new), "null", false, true).is_err());
     }
 
     #[test]
@@ -893,6 +945,26 @@ mod tests {
         for n in ["hw", "plughw", "dmix", "dshare"] {
             assert!(check(n, true).unwrap_err().contains("default card"), "{n}");
         }
+    }
+
+    #[test]
+    fn radio_allows_oss_only_on_a_numbered_unit() {
+        for n in ["oss_unit", "oss_sub", "oss_alias"] {
+            assert_eq!(check(n, true), Ok(Route::Oss), "{n}");
+            assert!(check(n, false).unwrap_err().contains("needs --radio"), "{n}");
+        }
+        for n in ["oss_bare", "oss_odd", "oss_dot", "oss_nounit", "oss_other"] {
+            assert!(check(n, true).unwrap_err().contains("use /dev/dspN"), "{n}");
+            assert!(check(n, false).unwrap_err().contains("needs --radio"), "{n}");
+        }
+    }
+
+    #[test]
+    fn oss_is_refused_off_freebsd() {
+        for n in ["oss_unit", "oss_sub", "oss_alias", "oss_bare", "oss_other"] {
+            assert!(check_on(n, true, false).unwrap_err().contains("only allowed on FreeBSD"), "{n}");
+        }
+        assert_eq!(check_on("radio", true, false), Ok(Route::Card));
     }
 
     #[test]

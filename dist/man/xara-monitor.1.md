@@ -2,7 +2,7 @@
 title: XARA-MONITOR
 section: 1
 header: User Commands
-date: 2026-10-29
+date: 2026-10-31
 ---
 
 # NAME
@@ -11,8 +11,8 @@ xara-monitor - passive VARA HF traffic monitor
 
 # SYNOPSIS
 
-**xara-monitor** (**--wav** *FILE* | **--stdin** *RATE* | [**--audio
-pulse**|**alsa**] **--capture** *SOURCE*) [*options*]
+**xara-monitor** (**--wav** *FILE* | **--stdin** *RATE* | [**--audio** *BACKEND*]
+**--capture** *SOURCE*) [*options*]
 
 # DESCRIPTION
 
@@ -29,13 +29,14 @@ timestamped details about the observed packets.
 
 :   s16le mono at *RATE* Hz (1000-1000000) on stdin
 
-**--audio** pulse|alsa
+**--audio** pulse|alsa|coreaudio
 
-:   Backend for **--capture** (default pulse, alsa when pulse is not present)
+:   Backend for **--capture** (default coreaudio on macOS, else pulse, or alsa
+    when pulse is not present)
 
 **--capture** *SOURCE*
 
-:   Pulse source or ALSA PCM, opened capture-only.
+:   Pulse source, ALSA PCM or CoreAudio device, opened capture-only.
 
 **--hf** 500|2300|2750
 

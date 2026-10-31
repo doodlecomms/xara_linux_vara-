@@ -22,6 +22,8 @@ for c in os.scandir(sys.argv[1]):
     json.dump(j, open(p, "w"))
 ' "$stage/$name/vendor"
 tar -C "$stage" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$mtime" \
+    --mode=u+rwX,go+rX,go-w \
     -cf - "$name/vendor" "$name/.cargo" | xz -9 > "$out/$name-vendor.tar.xz"
 rm -rf "$stage"
-ls -l "$out/$name.tar.xz" "$out/$name-vendor.tar.xz"
+"$root/scripts/release_buildinfo.sh" > "$out/$name.buildinfo"
+ls -l "$out/$name.tar.xz" "$out/$name-vendor.tar.xz" "$out/$name.buildinfo"

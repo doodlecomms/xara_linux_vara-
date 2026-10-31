@@ -1,3 +1,5 @@
+#[cfg(any(not(target_os = "linux"), test))]
+mod bouncer;
 pub mod command;
 pub mod kiss;
 pub mod response;

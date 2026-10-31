@@ -15,20 +15,68 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - run: echo "RUST=$(cat .rust-version)" >> "$GITHUB_ENV"
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse-dev libasound2-dev
-      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-      - run: cargo +stable fmt --all --check
-      - run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo +stable test --locked --release --workspace
-      - run: cargo +stable build --locked --release -p xara --no-default-features --features alsa
+      - run: rustup toolchain install "$RUST" --profile minimal --component rustfmt,clippy
+      - run: cargo +"$RUST" fmt --all --check
+      - run: cargo +"$RUST" clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo +"$RUST" clippy --locked -p xara --all-targets --features registered -- -D warnings
+      - run: cargo +"$RUST" clippy --locked -p xara --all-targets --no-default-features --features pulse -- -D warnings
+      - run: cargo +"$RUST" clippy --locked -p xara --all-targets --no-default-features --features alsa -- -D warnings
+      - run: cargo +"$RUST" test --locked --release --workspace
+      - run: cargo +"$RUST" test --locked --release -p xara-phy --features fixed-turbo
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "RUST=$(cat .rust-version)" >> "$GITHUB_ENV"
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse-dev libasound2-dev
+      - run: rustup toolchain install "$RUST" --profile minimal --component clippy
+      - run: cargo +"$RUST" clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo +"$RUST" test --locked --release --workspace
+      - run: cargo +"$RUST" test --locked --release -p xara-phy --features float-turbo
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "RUST=$(cat .rust-version)" >> "$GITHUB_ENV"
+      - run: rustup toolchain install "$RUST" --profile minimal --component clippy
+      - run: cargo +"$RUST" clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo +"$RUST" test --locked --release --workspace
+
+  freebsd:
+    runs-on: ubuntu-24.04
+    env:
+      PKG_CONFIG_ALLOW_CROSS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "RUST=$(cat .rust-version)" >> "$GITHUB_ENV"
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - run: rustup toolchain install "$RUST" --profile minimal --component clippy --target x86_64-unknown-freebsd
+      - run: cargo +"$RUST" clippy --locked --workspace --all-targets --target x86_64-unknown-freebsd -- -D warnings
 
   msrv:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse-dev libasound2-dev
-      - run: rustup toolchain install 1.85.0 --profile minimal
+      - run: >-
+          rustup toolchain install 1.85.0 --profile minimal
+          --target x86_64-unknown-freebsd,aarch64-apple-darwin,x86_64-apple-darwin
       - run: cargo +1.85.0 build --locked --release --workspace --all-targets
+      - name: check other OSes
+        env:
+          PKG_CONFIG_ALLOW_CROSS: 1
+        run: |
+          for t in x86_64-unknown-freebsd aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo +1.85.0 check --locked --workspace --all-targets --target "$t"
+          done
 
   arm:
     runs-on: ubuntu-24.04
@@ -36,14 +84,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-unknown-linux-musl, runner: qemu-aarch64 }
-          - { target: armv7-unknown-linux-musleabihf, runner: qemu-arm }
-          - { target: arm-unknown-linux-musleabihf, runner: qemu-arm -cpu arm1176 }
-        turbo: [default, float-turbo]
+          - { target: armv7-unknown-linux-musleabihf, runner: qemu-arm, turbo: default }
+          - { target: armv7-unknown-linux-musleabihf, runner: qemu-arm, turbo: float-turbo }
+          - { target: arm-unknown-linux-musleabihf, runner: qemu-arm -cpu arm1176, turbo: default }
+          - { target: arm-unknown-linux-musleabihf, runner: qemu-arm -cpu arm1176, turbo: float-turbo }
     steps:
       - uses: actions/checkout@v4
+      - run: echo "RUST=$(cat .rust-version)" >> "$GITHUB_ENV"
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
-      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - run: rustup toolchain install "$RUST" --profile minimal --target ${{ matrix.target }}
       - name: test under qemu
         shell: bash
         run: |
@@ -53,5 +102,8 @@ jobs:
           export CARGO_TARGET_${t}_RUNNER='${{ matrix.runner }}'
           features=()
           if [ '${{ matrix.turbo }}' != default ]; then features=(--features 'xara-phy/${{ matrix.turbo }}'); fi
-          cargo +stable test --locked --release --target ${{ matrix.target }} \
+          cargo +"$RUST" test --locked --release --target ${{ matrix.target }} \
             -p xara-phy -p xara-arq -p xara-host "${features[@]}"
+
+  bins:
+    uses: ./.github/workflows/bins.yml

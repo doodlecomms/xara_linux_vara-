@@ -1,13 +1,22 @@
-#[cfg(feature = "alsa")]
+#![cfg_attr(not(any(pulse, alsa, coreaudio)), expect(dead_code))]
+
+#[cfg(alsa)]
 pub mod alsa;
-#[cfg(feature = "pulse")]
+#[cfg(coreaudio)]
+pub mod coreaudio;
+#[cfg(coreaudio)]
+mod coreaudio_ffi;
+#[cfg(pulse)]
 pub mod pulse;
-#[cfg(feature = "pulse")]
+#[cfg(pulse)]
 mod pulse_ffi;
 pub mod ratematch;
+#[cfg(feature = "trusdx")]
+pub mod trusdx;
+pub mod txpath;
 
-#[cfg(not(any(feature = "pulse", feature = "alsa")))]
-compile_error!("xara needs an audio backend: enable the pulse or alsa feature");
+#[cfg(not(any(pulse, alsa, coreaudio, feature = "trusdx")))]
+compile_error!("xara needs an audio backend: enable the pulse or alsa feature, or build on macOS for CoreAudio");
 
 use std::collections::VecDeque;
 use std::io;
@@ -19,11 +28,40 @@ pub const RATE: u32 = 48000;
 pub const BLOCK: usize = 480;
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(1);
 const BEHIND: usize = RATE as usize / 10;
+const REPORT: Duration = Duration::from_secs(1);
 
 pub type DeviceList = Vec<(String, String)>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Path {
+    pub capture: Option<usize>,
+    pub keying: usize,
+    pub out: usize,
+    pub queue: bool,
+}
+
 fn capture_only() -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, "write to a capture-only audio device")
+}
+
+#[derive(Default)]
+struct Report {
+    seen: u64,
+    at: Option<Instant>,
+}
+
+impl Report {
+    fn due(&mut self, n: u64) -> bool {
+        if n <= self.seen {
+            return false;
+        }
+        self.seen = n;
+        let due = self.at.is_none_or(|t| t.elapsed() >= REPORT);
+        if due {
+            self.at = Some(Instant::now());
+        }
+        due
+    }
 }
 
 fn remaining(until: Instant, what: &str) -> io::Result<Duration> {
@@ -38,6 +76,10 @@ pub trait Audio {
     fn write(&mut self, x: &[i16]) -> io::Result<()>;
     fn queued(&mut self) -> io::Result<Option<Queue>>;
     fn backlog(&mut self) -> io::Result<Option<usize>>;
+    fn path(&mut self) -> io::Result<Path>;
+    fn ptt(&self) -> Option<Box<dyn crate::ptt::Ptt>> {
+        None
+    }
 }
 
 pub struct Behind {
@@ -88,6 +130,10 @@ pub fn quantize(v: f64) -> i16 {
     (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
 }
 
+pub fn samples(d: Duration) -> usize {
+    d.as_millis() as usize * (RATE / 1000) as usize
+}
+
 pub fn skip_backlog(io: &mut dyn Audio) -> io::Result<()> {
     let mut x = [0; BLOCK];
     for _ in 0..io.backlog()?.unwrap_or(0) / BLOCK {
@@ -123,11 +169,19 @@ impl TxAudio {
 pub enum Backend {
     Pulse,
     Alsa,
+    CoreAudio,
+    Trusdx,
 }
 
 impl Default for Backend {
     fn default() -> Self {
-        if cfg!(feature = "pulse") { Self::Pulse } else { Self::Alsa }
+        if cfg!(coreaudio) {
+            Self::CoreAudio
+        } else if cfg!(pulse) {
+            Self::Pulse
+        } else {
+            Self::Alsa
+        }
     }
 }
 
@@ -138,17 +192,26 @@ impl std::str::FromStr for Backend {
         let b = match s {
             "pulse" => Self::Pulse,
             "alsa" => Self::Alsa,
-            _ => return Err(format!("--audio {s:?}: expected pulse or alsa")),
+            "coreaudio" => Self::CoreAudio,
+            "trusdx" => Self::Trusdx,
+            _ => {
+                let built: Vec<_> = Self::ALL.into_iter().filter(|b| b.built()).map(Self::name).collect();
+                return Err(format!("--audio {s:?}: expected {}", crate::cli::either(&built)));
+            }
         };
-        if b.built() { Ok(b) } else { Err(format!("--audio {s}: this xara was built without the {s} feature")) }
+        if b.built() { Ok(b) } else { Err(format!("--audio {s}: {}", unbuilt_why(b))) }
     }
 }
 
 impl Backend {
+    const ALL: [Self; 4] = [Self::Pulse, Self::Alsa, Self::CoreAudio, Self::Trusdx];
+
     pub fn built(self) -> bool {
         match self {
-            Self::Pulse => cfg!(feature = "pulse"),
-            Self::Alsa => cfg!(feature = "alsa"),
+            Self::Pulse => cfg!(pulse),
+            Self::Alsa => cfg!(alsa),
+            Self::CoreAudio => cfg!(coreaudio),
+            Self::Trusdx => cfg!(feature = "trusdx"),
         }
     }
 
@@ -156,55 +219,87 @@ impl Backend {
         match self {
             Self::Pulse => "pulse",
             Self::Alsa => "alsa",
+            Self::CoreAudio => "coreaudio",
+            Self::Trusdx => "trusdx",
         }
     }
 }
 
-#[cfg(not(all(feature = "pulse", feature = "alsa")))]
-fn unbuilt(b: Backend) -> io::Error {
-    io::Error::other(format!("this xara was built without the {} feature", b.name()))
+fn unbuilt_why(b: Backend) -> String {
+    if b == Backend::CoreAudio {
+        "coreaudio is only available on macOS".into()
+    } else if cfg!(target_os = "macos") && b != Backend::Trusdx {
+        format!("{} is not available on macOS", b.name())
+    } else {
+        format!("xara was built without the {} feature", b.name())
+    }
 }
 
-pub fn open(b: Backend, capture: &str, playback: &str, radio: bool, tx: TxBuffer) -> io::Result<Box<dyn Audio>> {
+fn unbuilt(b: Backend) -> io::Error {
+    io::Error::other(unbuilt_why(b))
+}
+
+#[cfg_attr(not(all(feature = "trusdx", any(pulse, alsa, coreaudio))), expect(unused_variables))]
+pub fn open(
+    b: Backend,
+    capture: &str,
+    playback: &str,
+    radio: bool,
+    tx: TxBuffer,
+    speaker: bool,
+) -> io::Result<Box<dyn Audio>> {
     match b {
-        #[cfg(feature = "pulse")]
+        #[cfg(pulse)]
         Backend::Pulse => Ok(Box::new(pulse::PulseIo::open(capture, playback, radio, tx)?)),
-        #[cfg(feature = "alsa")]
+        #[cfg(alsa)]
         Backend::Alsa => Ok(Box::new(alsa::AlsaIo::open(capture, playback, radio, tx)?)),
-        #[cfg(not(all(feature = "pulse", feature = "alsa")))]
+        #[cfg(coreaudio)]
+        Backend::CoreAudio => Ok(Box::new(coreaudio::CoreAudioIo::open(capture, playback, radio, tx)?)),
+        #[cfg(feature = "trusdx")]
+        Backend::Trusdx => Ok(Box::new(trusdx::TrusdxIo::open(capture, playback, radio, speaker)?)),
         _ => Err(unbuilt(b)),
     }
 }
 
+#[cfg_attr(not(any(pulse, alsa, coreaudio)), expect(unused_variables))]
 pub fn check_playback(b: Backend, playback: &str, radio: bool) -> io::Result<()> {
     match b {
-        #[cfg(feature = "pulse")]
+        #[cfg(pulse)]
         Backend::Pulse => pulse::check(playback, radio),
-        #[cfg(feature = "alsa")]
+        #[cfg(alsa)]
         Backend::Alsa => alsa::resolve_playback(playback, radio).map(drop),
-        #[cfg(not(all(feature = "pulse", feature = "alsa")))]
+        #[cfg(coreaudio)]
+        Backend::CoreAudio => coreaudio::check(playback, radio),
+        #[cfg(feature = "trusdx")]
+        Backend::Trusdx => trusdx::check(playback),
         _ => Err(unbuilt(b)),
     }
 }
 
 pub fn list(b: Backend) -> io::Result<(DeviceList, DeviceList)> {
     match b {
-        #[cfg(feature = "pulse")]
+        #[cfg(pulse)]
         Backend::Pulse => pulse::list(),
-        #[cfg(feature = "alsa")]
+        #[cfg(alsa)]
         Backend::Alsa => alsa::list(),
-        #[cfg(not(all(feature = "pulse", feature = "alsa")))]
+        #[cfg(coreaudio)]
+        Backend::CoreAudio => coreaudio::list(),
+        #[cfg(feature = "trusdx")]
+        Backend::Trusdx => trusdx::list(),
         _ => Err(unbuilt(b)),
     }
 }
 
 pub fn open_capture(b: Backend, capture: &str) -> io::Result<Box<dyn Audio>> {
     match b {
-        #[cfg(feature = "pulse")]
+        #[cfg(pulse)]
         Backend::Pulse => Ok(Box::new(pulse::PulseIo::open_capture(capture)?)),
-        #[cfg(feature = "alsa")]
+        #[cfg(alsa)]
         Backend::Alsa => Ok(Box::new(alsa::AlsaIo::open_capture(capture)?)),
-        #[cfg(not(all(feature = "pulse", feature = "alsa")))]
+        #[cfg(coreaudio)]
+        Backend::CoreAudio => Ok(Box::new(coreaudio::CoreAudioIo::open_capture(capture)?)),
+        #[cfg(feature = "trusdx")]
+        Backend::Trusdx => Ok(Box::new(trusdx::TrusdxIo::open_capture(capture)?)),
         _ => Err(unbuilt(b)),
     }
 }
@@ -276,6 +371,10 @@ mod tests {
 
         fn backlog(&mut self) -> io::Result<Option<usize>> {
             Ok(self.waiting)
+        }
+
+        fn path(&mut self) -> io::Result<Path> {
+            Ok(Path { queue: true, ..Path::default() })
         }
     }
 

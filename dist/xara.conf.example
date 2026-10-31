@@ -20,6 +20,8 @@
 #  - save this file as ~/.config/xara/xara.conf; xara run by hand reads it too
 #
 #     systemctl --user enable --now xara
+#
+# on macOS, use dist/launchd/xara.plist instead
 
 ###
 # set your call
@@ -39,15 +41,20 @@
 # sound config (pick one)
 
 # ALSA
-# list devices: arecord -L / aplay -L
+# list devices: xara --list-devices --audio alsa
 #audio = alsa
 #capture = plughw:CARD=Device,DEV=0
 #playback = plughw:CARD=Device,DEV=0
 
 # pipewire/pulse
-# list devices: pactl list short sources / pactl list short sinks
+# list devices: xara --list-devices --audio pulse
 #capture = alsa_input.usb-XXXX
 #playback = alsa_output.usb-XXXX
+
+# macOS (CoreAudio)
+# list devices: xara --list-devices
+#capture = USB Audio CODEC
+#playback = USB Audio CODEC
 
 # null sinks only, no radio (can't be used with radio or ptt)
 #capture = xara_rx.monitor
@@ -62,7 +69,10 @@
 #radio = on
 #drive-db = -10
 
-# CM108/AIOC GPIO, /dev/hidrawN numbers can change between boots
+# CM108 with AIOC GPIO by USB id from lsusb (or ioreg on macOS)
+#ptt = cm108:1209:7388
+
+# or by path, but /dev/hidrawN numbers can change between boots
 #ptt = cm108:/dev/hidraw0
 
 # DTR on a USB serial port, use name from /dev/serial/by-id/

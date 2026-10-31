@@ -2,7 +2,7 @@
 title: XARA
 section: 1
 header: User Commands
-date: 2026-10-29
+date: 2026-10-31
 ---
 
 # NAME
@@ -11,15 +11,16 @@ xara - VARA-compatible HF/FM modem
 
 # SYNOPSIS
 
-**xara** [**--audio pulse**|**alsa**] **--call** *CALL* **--capture** *SOURCE* **--playback** *SINK*
+**xara** [**--audio** *BACKEND*] **--call** *CALL* **--capture** *SOURCE* **--playback** *SINK*
 [*options*]\
-**xara** [**--audio pulse**|**alsa**] **--radio --ptt** *PTT* **--call** *CALL* **--capture** *SOURCE*
-**--playback** *SINK* [*options*]
+**xara** [**--audio** *BACKEND*] **--radio --ptt** *PTT* **--call** *CALL* **--capture** *SOURCE*
+**--playback** *SINK* [*options*]\
+**xara** [**--audio** *BACKEND*] **--list-devices**
 
 # DESCRIPTION
 
 **xara** is a modem compatible with VARA HF and VARA FM. It supports audio via
-ALSA and PipeWire/Pulse. It also exposes TCP ports for VARA's command and data
+ALSA and PipeWire/Pulse on Linux and FreeBSD, and CoreAudio on macOS. It also exposes TCP ports for VARA's command and data
 along with KISS for applications such as Pat. See the README for full details.
 
 # OPTIONS
@@ -34,18 +35,25 @@ along with KISS for applications such as Pat. See the README for full details.
     Without **--config**, xara reads *$XDG_CONFIG_HOME/xara/xara.conf* (by
     default *~/.config/xara/xara.conf*) if it exists.
 
-**--audio** pulse|alsa
+**--audio** pulse|alsa|coreaudio
 
-:   Audio backend. Defaults to Pulse if compiled in, otherwise ALSA.
+:   Audio backend. On macOS, CoreAudio is the default and only backend.
+    Elsewhere the default is Pulse if compiled in, otherwise ALSA.
+
+**--list-devices**
+
+:   List capture and playback devices for **--audio**.
 
 **--capture** *SOURCE*
 
-:   Pulse source or ALSA PCM to receive from (required).
+:   Pulse source, ALSA PCM, or CoreAudio device to receive from (required).
+    CoreAudio devices are named by UID or exact name.
 
 **--playback** *SINK*
 
-:   Pulse sink or ALSA PCM to transmit into (required). Without **--radio**, it must be
-    a Pulse null sink or the ALSA **null** PCM.
+:   Pulse sink, ALSA PCM, or CoreAudio device to transmit into (required).
+    Without **--radio**, it must be a Pulse null sink, the ALSA **null** PCM,
+    or a virtual CoreAudio device such as BlackHole.
 
 **--tx-buffer-ms** *N*
 
@@ -136,9 +144,13 @@ along with KISS for applications such as Pat. See the README for full details.
 
 **--ptt** *PTT*
 
-:   PTT method; requires **--radio**. One of **vox** **rts:***DEV* or
-    **dtr:***DEV*, **cm108:***DEV[:GPIO]*, or
+:   PTT method; requires **--radio**. One of **vox**, **rts:***DEV* or
+    **dtr:***DEV*, **cm108:***DEV[:GPIO]*, **cm108:***VID***:***PID[:GPIO]*, or
     **rigctld**[**:***HOST***:***PORT*]. For full details see README.
+
+    **cm108:***VID***:***PID* identifies the device by the 4-digit hex
+    USB IDs, which survives a hidraw renumbering. device itself, so it
+    survives hidraw renumbering.
 
 **--ptt-lead-ms** *N*
 
@@ -185,6 +197,20 @@ along with KISS for applications such as Pat. See the README for full details.
 **130**
 
 :   Stopped by SIGINT, SIGTERM, SIGHUP or SIGQUIT. PTT will have been released
+
+# PLATFORMS
+
+**FreeBSD**
+
+:   ALSA goes through alsa-plugins' OSS PCM. With **--radio**, playback must
+    pin a numbered */dev/dspN*. cm108 PTT needs hidraw(4). Serial devices are
+    */dev/cuaU\**.
+
+**macOS**
+
+:   CoreAudio only. Grant microphone access when requested. Serial
+    devices are */dev/cu.\**. A launchd agent is in *dist/launchd*. It
+    requests microphone access on first launch and on each reinstall.
 
 # SAFETY
 

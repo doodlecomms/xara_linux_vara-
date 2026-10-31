@@ -1,15 +1,14 @@
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::pulse_ffi::{
-    BufferAttr, Conn, Peek, S16LE, STREAM_ADJUST_LATENCY, STREAM_AUTO_TIMING_UPDATE, STREAM_DONT_MOVE,
+    BufferAttr, Conn, Peek, RAW_TIMING, S16LE, STREAM_ADJUST_LATENCY, STREAM_AUTO_TIMING_UPDATE, STREAM_DONT_MOVE,
     STREAM_INTERPOLATE_TIMING, SampleSpec, Stream,
 };
 use super::ratematch::{Queue, TxBuffer};
-use super::{Audio, BLOCK, DeviceList, IO_TIMEOUT, RATE, capture_only};
+use super::{Audio, BLOCK, DeviceList, IO_TIMEOUT, Path, RATE, Report, capture_only};
 
 const SETUP: Duration = Duration::from_secs(5);
-const REPORT: Duration = Duration::from_secs(1);
 const SPEC: SampleSpec = SampleSpec { format: S16LE, rate: RATE, channels: 1 };
 
 fn connect() -> io::Result<Conn> {
@@ -113,17 +112,21 @@ struct Play {
     s: Stream,
     name: String,
     buf: TxBuffer,
-    underruns: u64,
-    reported: Option<Instant>,
+    report: Report,
     ceiling: usize,
     asked: bool,
 }
 
 impl Play {
     fn queue(&self) -> Option<Queue> {
-        let n = frames(self.s.latency_us()?);
-        let floor = self.s.sink_us().map_or(0, frames).min(n);
-        Some(Queue { frames: n, floor, underruns: self.underruns })
+        let Some(t) = self.s.timing() else {
+            return Some(Queue { frames: frames(self.s.latency_us()?), floor: 0, underruns: self.report.seen });
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+        let age = if t.playing { frames(now.saturating_sub(t.at).as_micros() as u64) } else { 0 };
+        let floor = frames(t.sink_us);
+        let ours = usize::try_from(t.ahead / 2).unwrap_or(0).saturating_sub(age);
+        Some(Queue { frames: ours + floor, floor, underruns: self.report.seen })
     }
 
     fn full(&mut self, n: usize) -> Option<&'static str> {
@@ -170,7 +173,7 @@ impl PulseIo {
             fragsize: bytes(10),
         };
         let mut rec = Stream::new(&conn, c"rx", &SPEC).ok_or_else(|| io::Error::other("pulse stream"))?;
-        rec.connect_record(capture, &attr, flags)?;
+        rec.connect_record(capture, &attr, flags | STREAM_INTERPOLATE_TIMING | STREAM_AUTO_TIMING_UPDATE)?;
         let play = match playback {
             Some((name, _, buf)) => {
                 let mut p = Stream::new(&conn, c"tx", &SPEC).ok_or_else(|| io::Error::other("pulse stream"))?;
@@ -181,9 +184,10 @@ impl PulseIo {
                     minreq: u32::MAX,
                     fragsize: u32::MAX,
                 };
-                p.connect_playback(name, &attr, flags | STREAM_INTERPOLATE_TIMING | STREAM_AUTO_TIMING_UPDATE)?;
+                let timing = if RAW_TIMING { 0 } else { STREAM_INTERPOLATE_TIMING | STREAM_AUTO_TIMING_UPDATE };
+                p.connect_playback(name, &attr, flags | timing)?;
                 p.count_underflows();
-                Some(Play { s: p, name: name.into(), buf, underruns: 0, reported: None, ceiling: 0, asked: false })
+                Some(Play { s: p, name: name.into(), buf, report: Report::default(), ceiling: 0, asked: false })
             }
             None => None,
         };
@@ -244,20 +248,26 @@ impl Audio for PulseIo {
         self.conn.dispatch("playback")?;
         play.s.live("playback")?;
         let n = play.s.underflows();
-        if n > play.underruns {
-            play.underruns = n;
-            if play.reported.is_none_or(|t| t.elapsed() >= REPORT) {
-                play.reported = Some(Instant::now());
-                say!("pulse playback {:?}: underrun ({n} so far)", play.name);
-            }
+        if play.report.due(n) {
+            say!("pulse playback {:?}: underrun ({n} so far)", play.name);
         }
-        Ok(play.queue())
+        let q = play.queue();
+        if RAW_TIMING {
+            play.s.request_timing();
+        }
+        Ok(q)
     }
 
     fn backlog(&mut self) -> io::Result<Option<usize>> {
         self.conn.dispatch("capture")?;
         self.rec.live("capture")?;
         Ok(self.rec.readable().map(|n| (n + self.rx.len()) / 2))
+    }
+
+    fn path(&mut self) -> io::Result<Path> {
+        let us = self.rec.latency_us();
+        let capture = us.map(|us| frames(us).saturating_sub(self.rec.readable().unwrap_or(0) / 2));
+        Ok(Path { capture, queue: true, ..Path::default() })
     }
 }
 

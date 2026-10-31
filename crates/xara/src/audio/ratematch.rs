@@ -18,7 +18,7 @@ const FAR_FRAMES: f64 = 240.0;
 const MIN_FLOOR_FRAMES: f64 = 960.0;
 pub const MAX_SKEW: f64 = 0.01;
 const SKEW_REPORT: f64 = 1e-3;
-const STALL: Duration = Duration::from_millis(30);
+pub const STALL: Duration = Duration::from_millis(30);
 const SLOW: Duration = Duration::from_millis(20);
 const SKIP_BLOCKS: usize = 20;
 const SETTLE_BLOCKS: usize = 50;
@@ -261,7 +261,7 @@ impl Control {
     }
 
     fn latency(&self) -> usize {
-        self.told.unwrap_or(self.target as usize + Interp::DELAY)
+        self.told.unwrap_or(self.target as usize)
     }
 
     fn align(&mut self, out: &mut Vec<f64>) {
@@ -344,7 +344,7 @@ impl Control {
     }
 
     fn path(&self) -> usize {
-        (self.set + self.floor).round() as usize + Interp::DELAY
+        (self.set + self.floor).round() as usize
     }
 
     fn moved(&self) -> bool {
@@ -750,7 +750,7 @@ mod tests {
                 .collect();
             let at = format!("{skew} {chunk}");
             assert_eq!(latency.len(), 1, "{at}: {:?}", d.events);
-            assert!(latency[0].abs_diff(set + 300 + Interp::DELAY) <= 4, "{at}: {latency:?} {set}");
+            assert!(latency[0].abs_diff(set + 300) <= 4, "{at}: {latency:?} {set}");
             assert_eq!(d.r.latency(), latency[0], "{at}");
         }
     }
@@ -802,7 +802,7 @@ mod tests {
             let latency: Vec<usize> =
                 d.events.iter().filter_map(|e| if let Event::Latency(n) = e { Some(*n) } else { None }).collect();
             assert!((hold - held as f64).abs() < 10.0, "{floor} {told}: {hold}");
-            assert_eq!(latency, [hold.round() as usize + told + Interp::DELAY], "{floor} {told}: {:?}", d.events);
+            assert_eq!(latency, [hold.round() as usize + told], "{floor} {told}: {:?}", d.events);
         }
     }
 
@@ -1017,7 +1017,7 @@ mod tests {
             assert!(raised.len() == usize::from(d.underruns > 0), "{at}: {:?}", d.events);
             assert!(raised.iter().all(|&h| h > TARGET as f64 + 512.0 && h <= 3.0 * TARGET as f64), "{at}: {raised:?}");
             assert_eq!(last, Some(d.r.latency()), "{at}");
-            assert!(d.r.latency().abs_diff(d.r.ctl.set as usize + Interp::DELAY) <= 4, "{at}: {}", d.r.latency());
+            assert!(d.r.latency().abs_diff(d.r.ctl.set as usize) <= 4, "{at}: {}", d.r.latency());
             assert!(!learned || (-d.r.ctl.integral - skew).abs() * 1e6 < 100.0, "{at}: {}", d.r.ctl.integral);
         }
     }
@@ -1033,7 +1033,7 @@ mod tests {
             }
             assert_eq!(d.events, [Event::NoQueue], "{skew}");
             assert!(matches!(d.r.ctl.state, State::Open), "{skew}");
-            assert_eq!(d.r.latency(), TARGET + Interp::DELAY, "{skew}");
+            assert_eq!(d.r.latency(), TARGET, "{skew}");
         }
     }
 

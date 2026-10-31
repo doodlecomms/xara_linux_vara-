@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use xara_host::command::Command;
 use xara_host::kiss::{Deframer, FEND, KissServer};
 use xara_host::server::{DATA_CHUNK, Host, INPUT_QUEUE, Input, MAX_LINE};
+use xara_testkit::net::turned_away;
 
 #[test]
 fn a_client_that_stops_reading_does_not_block_the_host() {
@@ -58,11 +59,10 @@ fn an_over_long_command_line_is_dropped() {
 
 #[test]
 fn a_second_client_is_refused_and_the_port_stays_ours() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let (h, mut first) = command_host();
     for _ in 0..3 {
-        let e = TcpStream::connect(h.cmd_addr).map(drop).unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(turned_away(h.cmd_addr));
     }
     first.write_all(b"BW500\r").unwrap();
     assert!(matches!(h.input.recv_timeout(Duration::from_secs(1)), Ok(Input::Command(Command::Bw(_)))));
@@ -71,18 +71,21 @@ fn a_second_client_is_refused_and_the_port_stays_ours() {
     }
     drop(first);
     assert!(matches!(h.input.recv_timeout(Duration::from_secs(1)), Ok(Input::Closed)));
-    let t0 = Instant::now();
-    let mut third = loop {
-        let mut c = connect_soon(h.cmd_addr);
-        if let Ok(Input::Connected) = h.input.recv_timeout(Duration::from_millis(200)) {
-            break c;
-        }
-        c.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        let _ = c.read(&mut [0; 1]);
-        assert!(t0.elapsed() < Duration::from_secs(2));
-    };
+    let mut third = connect_soon(h.cmd_addr);
+    assert!(matches!(h.input.recv_timeout(Duration::from_secs(1)), Ok(Input::Connected)));
     third.write_all(b"BW2750\r").unwrap();
     assert!(matches!(h.input.recv_timeout(Duration::from_secs(1)), Ok(Input::Command(Command::Bw(_)))));
+}
+
+#[test]
+fn a_client_back_right_after_closed_is_served() {
+    let h = Host::bind("127.0.0.1", 0).unwrap();
+    for _ in 0..100 {
+        let c = TcpStream::connect(h.cmd_addr).unwrap();
+        assert!(matches!(h.input.recv_timeout(Duration::from_secs(1)), Ok(Input::Connected)));
+        drop(c);
+        assert!(matches!(h.input.recv_timeout(Duration::from_secs(1)), Ok(Input::Closed)));
+    }
 }
 
 #[test]
@@ -151,10 +154,7 @@ fn an_over_long_kiss_frame_is_dropped() {
 fn ports_reopen_after_xara_closes_the_other_port() {
     let h = Host::bind("127.0.0.1", 0).unwrap();
     for _ in 0..3 {
-        let (c, d) = (connect_soon(h.cmd_addr), connect_soon(h.data_addr));
-        for _ in 0..2 {
-            assert!(matches!(h.input.recv_timeout(Duration::from_secs(1)), Ok(Input::Connected)));
-        }
+        let (c, d) = (reconnect(&h, h.cmd_addr), reconnect(&h, h.data_addr));
         drop(d);
         assert!(matches!(h.input.recv_timeout(Duration::from_secs(1)), Ok(Input::Closed)));
         let mut probe = [0u8; 1];
@@ -171,6 +171,20 @@ fn connect_soon(a: std::net::SocketAddr) -> TcpStream {
             Err(e) => assert!(t0.elapsed() < Duration::from_secs(2), "{a}: {e}"),
         }
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn reconnect(h: &Host, a: std::net::SocketAddr) -> TcpStream {
+    use std::io::Read;
+    let t0 = Instant::now();
+    loop {
+        let mut c = connect_soon(a);
+        if let Ok(Input::Connected) = h.input.recv_timeout(Duration::from_millis(200)) {
+            return c;
+        }
+        let _ = c.set_read_timeout(Some(Duration::from_millis(50)));
+        let _ = c.read(&mut [0; 1]);
+        assert!(t0.elapsed() < Duration::from_secs(2));
     }
 }
 

@@ -45,12 +45,16 @@ impl std::fmt::Debug for Failure {
 pub struct Air<M: Modem, const N: usize> {
     pub st: [M; N],
     pub wire: [VecDeque<f64>; N],
+    pub lag: [VecDeque<f64>; N],
     pub ears: [&'static [usize]; N],
     pub noise: f64,
     pub rng: Rng,
     pub skip: fn(&Report) -> bool,
     pub got: [Vec<u8>; N],
     pub events: [Vec<(f64, Report)>; N],
+    pub bursts: [Vec<(usize, usize)>; N],
+    on_air: [Option<(usize, usize)>; N],
+    pos: usize,
 }
 
 impl<M: Modem> Air<M, 2> {
@@ -70,13 +74,22 @@ impl<M: Modem, const N: usize> Air<M, N> {
         Self {
             st,
             wire: delay.map(|d| VecDeque::from(vec![0.0; d])),
+            lag: std::array::from_fn(|_| VecDeque::new()),
             ears,
             noise,
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             skip,
             got: std::array::from_fn(|_| Vec::new()),
             events: std::array::from_fn(|_| Vec::new()),
+            bursts: std::array::from_fn(|_| Vec::new()),
+            on_air: [None; N],
+            pos: 0,
         }
+    }
+
+    pub fn lagged(mut self, lag: [usize; N]) -> Self {
+        self.lag = lag.map(|d| VecDeque::from(vec![0.0; d]));
+        self
     }
 
     pub fn secs(&self) -> f64 {
@@ -86,11 +99,17 @@ impl<M: Modem, const N: usize> Air<M, N> {
     pub fn step(&mut self) {
         let heard: [Vec<f64>; N] =
             std::array::from_fn(|i| (0..BLOCK).map(|_| self.wire[i].pop_front().unwrap_or(0.0)).collect());
+        for (i, h) in heard.iter().enumerate() {
+            self.track(i, h);
+        }
+        self.pos += BLOCK;
         let mut outs: [Vec<f64>; N] = std::array::from_fn(|_| vec![0.0; BLOCK]);
         for (i, out) in outs.iter_mut().enumerate() {
-            let input: Vec<f64> = (0..BLOCK)
+            let air: Vec<f64> = (0..BLOCK)
                 .map(|k| self.ears[i].iter().map(|&j| heard[j][k]).sum::<f64>() + self.noise * self.rng.gauss())
                 .collect();
+            self.lag[i].extend(air);
+            let input: Vec<f64> = self.lag[i].drain(..BLOCK).collect();
             self.st[i].process(&input, out);
             let t = self.secs();
             while let Some(r) = self.st[i].pop() {
@@ -104,6 +123,33 @@ impl<M: Modem, const N: usize> Air<M, N> {
         for (w, out) in self.wire.iter_mut().zip(outs) {
             w.extend(out);
         }
+    }
+
+    fn track(&mut self, i: usize, heard: &[f64]) {
+        for (k, &v) in heard.iter().enumerate() {
+            let t = self.pos + k;
+            self.on_air[i] = match (self.on_air[i], v != 0.0) {
+                (None, true) => Some((t, t)),
+                (Some((s, _)), true) => Some((s, t)),
+                (Some((s, e)), false) if t - e >= BLOCK => {
+                    self.bursts[i].push((s, e + 1));
+                    None
+                }
+                (b, _) => b,
+            };
+        }
+    }
+
+    pub fn reply_gaps(&self, from: usize, to: usize) -> Vec<f64> {
+        self.bursts[to]
+            .iter()
+            .filter_map(|&(start, _)| {
+                let heard = self.bursts[from].iter().rfind(|b| b.1 <= start)?;
+                let own = self.bursts[to].iter().rfind(|b| b.1 <= start);
+                (own.is_none_or(|o| o.1 <= heard.0) && start - heard.1 < FS as usize)
+                    .then(|| (start - heard.1) as f64 * 1e3 / FS)
+            })
+            .collect()
     }
 
     pub fn run_until(&mut self, secs: f64, mut done: impl FnMut(&Self) -> bool) -> bool {

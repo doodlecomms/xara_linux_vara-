@@ -5,12 +5,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 
+#[cfg(target_os = "linux")]
+use libc::__errno_location as errno_location;
+#[cfg(not(target_os = "linux"))]
+use libc::__error as errno_location;
+
 static PIPE: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn deliver(_: libc::c_int) {
     // SAFETY: errno is thread-local and restored before returning; write is async-signal-safe.
     unsafe {
-        let errno = libc::__errno_location();
+        let errno = errno_location();
         let saved = *errno;
         libc::write(PIPE.load(Ordering::Relaxed), [0u8].as_ptr().cast(), 1);
         *errno = saved;
@@ -19,17 +24,33 @@ extern "C" fn deliver(_: libc::c_int) {
 
 struct Signals(File);
 
-impl Signals {
-    fn new(sigs: &[libc::c_int]) -> io::Result<Self> {
-        let mut fds = [0; 2];
-        // SAFETY: fds has room for the two descriptors pipe2 writes.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+fn cloexec_pipe() -> io::Result<(File, OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: fds has room for the two descriptors pipe2 writes.
+    #[cfg(not(target_os = "macos"))]
+    let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    // SAFETY: fds has room for the two descriptors pipe writes.
+    #[cfg(target_os = "macos")]
+    let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the pipe just returned both descriptors and nothing else owns them.
+    let (rx, tx) = unsafe { (File::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    #[cfg(target_os = "macos")]
+    for fd in [rx.as_raw_fd(), tx.as_raw_fd()] {
+        // SAFETY: fd is an open descriptor.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: pipe2 just returned fds[0] and nothing else owns it.
-        let rx = Signals(unsafe { File::from_raw_fd(fds[0]) });
-        // SAFETY: pipe2 just returned fds[1] and nothing else owns it.
-        let tx = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    }
+    Ok((rx, tx))
+}
+
+impl Signals {
+    fn new(sigs: &[libc::c_int]) -> io::Result<Self> {
+        let (rx, tx) = cloexec_pipe()?;
+        let rx = Signals(rx);
         // SAFETY: tx is an open descriptor.
         if unsafe { libc::fcntl(tx.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
             return Err(io::Error::last_os_error());

@@ -32,12 +32,14 @@ impl<T> Sh<T> {
     }
 
     unsafe fn all(&self) -> &[T] {
+        // SAFETY: the caller keeps the slice alive and overlaps no part() it holds.
         unsafe { std::slice::from_raw_parts(self.0, self.1) }
     }
 
     #[allow(clippy::mut_from_ref)]
     unsafe fn part(&self, r: Range<usize>) -> &mut [T] {
         assert!(r.start <= r.end && r.end <= self.1);
+        // SAFETY: r is in bounds and the caller keeps it unaliased for the borrow.
         unsafe { std::slice::from_raw_parts_mut(self.0.add(r.start), r.len()) }
     }
 }

@@ -10,8 +10,16 @@ use std::sync::{Arc, Condvar, Mutex, Once, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::Ioctl;
+#[cfg(target_os = "macos")]
+use crate::hid::cm108_usb;
+pub use crate::hidraw::is_hidraw;
+
 pub trait Ptt: Send {
     fn set(&mut self, on: bool) -> io::Result<()>;
+    fn release(&mut self) -> io::Result<()> {
+        self.set(false)
+    }
     fn describe(&self) -> String;
 }
 
@@ -21,7 +29,9 @@ pub enum PttSpec {
     Rts(String),
     Dtr(String),
     Cm108 { path: String, gpio: u8 },
+    Cm108Usb { vendor: u16, product: u16, gpio: u8 },
     Rigctld(String),
+    Trusdx,
 }
 
 pub const RIGCTLD_DEFAULT: &str = "127.0.0.1:4532";
@@ -40,19 +50,41 @@ impl PttSpec {
             "vox" if rest.is_empty() => Ok(Self::Vox),
             "rts" => path("rts").map(Self::Rts),
             "dtr" => path("dtr").map(Self::Dtr),
-            "cm108" => {
-                let (p, g) = match rest.rsplit_once(':') {
-                    Some((p, g)) => (p, g.parse::<u8>().map_err(|e| format!("--ptt cm108 gpio: {e}"))?),
-                    None => (rest, 3),
-                };
-                if !p.starts_with('/') || !(1..=8).contains(&g) {
-                    return Err("--ptt cm108:/dev/hidrawN[:GPIO 1-8]".into());
-                }
-                Ok(Self::Cm108 { path: p.into(), gpio: g })
+            "cm108" if cfg!(target_os = "macos") && rest.starts_with('/') => {
+                Err("--ptt cm108: macOS has no hidraw; use cm108:VID:PID[:GPIO] (4-digit hex USB ids)".into())
             }
+            "cm108" => Self::cm108(rest).ok_or_else(|| {
+                let dev = if cfg!(target_os = "macos") { "" } else { "/dev/hidrawN[:GPIO] or " };
+                format!("--ptt cm108: expected {dev}VID:PID[:GPIO] (VID and PID as 4-digit hex, GPIO 1-8)")
+            }),
+            "trusdx" if !cfg!(feature = "trusdx") => {
+                Err("--ptt trusdx: xara was built without the trusdx feature".into())
+            }
+            "trusdx" if rest.is_empty() => Ok(Self::Trusdx),
             "rigctld" => Ok(Self::Rigctld(if rest.is_empty() { RIGCTLD_DEFAULT.into() } else { rest.into() })),
-            _ => Err(format!("--ptt {s:?}: expected vox, rts:DEV, dtr:DEV, cm108:DEV[:GPIO] or rigctld[:HOST:PORT]")),
+            _ => {
+                let cm108 = if cfg!(target_os = "macos") { "cm108:VID:PID[:GPIO]" } else { "cm108:DEV|VID:PID[:GPIO]" };
+                let mut all = vec!["vox", "rts:DEV", "dtr:DEV", cm108, "rigctld[:HOST:PORT]"];
+                if cfg!(feature = "trusdx") {
+                    all.push("trusdx");
+                }
+                Err(format!("--ptt {s:?}: expected {}", crate::cli::either(&all)))
+            }
         }
+    }
+
+    fn cm108(s: &str) -> Option<Self> {
+        let gpio = |g: Option<&str>| g.map_or(Some(3), |g| g.parse().ok().filter(|g| (1..=8).contains(g)));
+        if s.starts_with('/') {
+            let (path, g) = s.rsplit_once(':').map_or((s, None), |(p, g)| (p, Some(g)));
+            return Some(Self::Cm108 { path: path.into(), gpio: gpio(g)? });
+        }
+        let id = |v: &str| {
+            u16::from_str_radix(v, 16).ok().filter(|_| v.len() == 4 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+        };
+        let mut f = s.split(':');
+        let (vendor, product, g) = (id(f.next()?)?, id(f.next()?)?, f.next());
+        f.next().is_none().then_some(Self::Cm108Usb { vendor, product, gpio: gpio(g)? })
     }
 
     pub fn open(&self) -> io::Result<Box<dyn Ptt>> {
@@ -61,7 +93,9 @@ impl PttSpec {
             Self::Rts(p) => Box::new(Serial::open(p, libc::TIOCM_RTS)?),
             Self::Dtr(p) => Box::new(Serial::open(p, libc::TIOCM_DTR)?),
             Self::Cm108 { path, gpio } => Box::new(Cm108::open(path, *gpio)?),
+            Self::Cm108Usb { vendor, product, gpio } => cm108_usb(*vendor, *product, *gpio)?,
             Self::Rigctld(a) => Box::new(Rigctld::open(a)?),
+            Self::Trusdx => return Err(io::Error::other("--ptt trusdx comes with --audio trusdx")),
         })
     }
 }
@@ -84,26 +118,37 @@ pub struct Serial {
     line: libc::c_int,
 }
 
+pub fn open_tty(path: &str) -> io::Result<File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
+    if !f.is_terminal() {
+        return Err(io::Error::other(format!("{path} is not a serial port")));
+    }
+    Ok(f)
+}
+
+pub fn modem(f: &File, req: Ioctl, bits: libc::c_int) -> io::Result<()> {
+    // SAFETY: f is open and bits is the int the request reads.
+    if unsafe { libc::ioctl(f.as_raw_fd(), req, &bits) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl Serial {
     pub fn open(path: &str, line: libc::c_int) -> io::Result<Self> {
-        let f = OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK).open(path)?;
-        if !f.is_terminal() {
-            return Err(io::Error::other(format!("{path} is not a serial port")));
-        }
-        let s = Self { f, path: path.into(), line };
-        s.modem(libc::TIOCMBIC, libc::TIOCM_RTS | libc::TIOCM_DTR)?;
-        Ok(s)
-    }
-
-    fn modem(&self, req: libc::Ioctl, bits: libc::c_int) -> io::Result<()> {
-        if unsafe { libc::ioctl(self.f.as_raw_fd(), req, &bits) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        let f = open_tty(path)?;
+        modem(&f, libc::TIOCMBIC, libc::TIOCM_RTS | libc::TIOCM_DTR)?;
+        Ok(Self { f, path: path.into(), line })
     }
 
     fn lines(&self) -> io::Result<libc::c_int> {
         let mut bits: libc::c_int = 0;
+        // SAFETY: self.f is open and bits is the int TIOCMGET writes.
         if unsafe { libc::ioctl(self.f.as_raw_fd(), libc::TIOCMGET, &mut bits) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -113,7 +158,7 @@ impl Serial {
 
 impl Ptt for Serial {
     fn set(&mut self, on: bool) -> io::Result<()> {
-        self.modem(if on { libc::TIOCMBIS } else { libc::TIOCMBIC }, self.line)?;
+        modem(&self.f, if on { libc::TIOCMBIS } else { libc::TIOCMBIC }, self.line)?;
         if (self.lines()? & self.line != 0) != on {
             return Err(io::Error::other(format!("{}: modem line did not follow", self.path)));
         }
@@ -136,15 +181,9 @@ pub fn cm108_report(gpio: u8, on: bool) -> [u8; 5] {
     [0, 0, if on { m } else { 0 }, m, 0]
 }
 
-pub fn is_hidraw(path: &str) -> bool {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let Ok(m) = std::fs::metadata(path) else { return false };
-    if !m.file_type().is_char_device() {
-        return false;
-    }
-    let (major, minor) = (libc::major(m.rdev()), libc::minor(m.rdev()));
-    std::fs::read_link(format!("/sys/dev/char/{major}:{minor}/subsystem"))
-        .is_ok_and(|l| l.file_name().is_some_and(|n| n == "hidraw"))
+#[cfg(not(target_os = "macos"))]
+fn cm108_usb(vendor: u16, product: u16, gpio: u8) -> io::Result<Box<dyn Ptt>> {
+    Ok(Box::new(Cm108::open(&crate::hidraw::find(vendor, product)?, gpio)?))
 }
 
 impl Cm108 {
@@ -254,7 +293,7 @@ thread_local! {
 }
 
 fn watched() -> std::sync::MutexGuard<'static, Vec<Watched>> {
-    WATCHED.lock().unwrap_or_else(PoisonError::into_inner)
+    crate::lock(&WATCHED)
 }
 
 pub fn panicked() -> bool {
@@ -325,7 +364,7 @@ impl Keyer {
 
     fn release(&mut self) -> bool {
         for _ in 0..3 {
-            if self.dev.set(false).is_ok() {
+            if self.dev.release().is_ok() {
                 self.keyed = false;
                 mark_released(&self.released, true);
                 return true;
@@ -440,6 +479,9 @@ impl PttCtl {
             }
             drop(rx);
             let keyed = k.keyed;
+            if !keyed {
+                let _ = k.dev.release();
+            }
             let released = !keyed || k.release();
             k.keyed = false;
             if keyed {

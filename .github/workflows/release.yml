@@ -12,53 +12,20 @@ env:
 
 jobs:
   bins:
-    runs-on: ${{ matrix.runner }}
-    container: ubuntu:22.04
-    env:
-      DEBIAN_FRONTEND: noninteractive
-    strategy:
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04 }
-          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
-          - { target: armv7-unknown-linux-gnueabihf, runner: ubuntu-24.04, cross: armhf, cc: arm-linux-gnueabihf }
-    steps:
-      - uses: actions/checkout@v4
-      - name: deps
-        shell: bash
-        run: |
-          pkgs=(ca-certificates curl gcc libc6-dev pkg-config xz-utils)
-          if [ -n '${{ matrix.cross }}' ]; then
-            dpkg --add-architecture '${{ matrix.cross }}'
-            sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-            for s in jammy jammy-updates jammy-security; do
-              echo "deb [arch=${{ matrix.cross }}] http://ports.ubuntu.com/ubuntu-ports $s main universe"
-            done > /etc/apt/sources.list.d/ports.list
-            pkgs+=(gcc-${{ matrix.cc }} libc6-dev-${{ matrix.cross }}-cross
-                   libpulse-dev:${{ matrix.cross }} libasound2-dev:${{ matrix.cross }})
-            t=$(echo '${{ matrix.target }}' | tr a-z- A-Z_)
-            echo "CARGO_TARGET_${t}_LINKER=${{ matrix.cc }}-gcc" >> "$GITHUB_ENV"
-            echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
-            echo "PKG_CONFIG_LIBDIR=/usr/lib/${{ matrix.cc }}/pkgconfig:/usr/share/pkgconfig" >> "$GITHUB_ENV"
-          else
-            pkgs+=(libpulse-dev libasound2-dev)
-          fi
-          apt-get update
-          apt-get install -y --no-install-recommends "${pkgs[@]}"
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-            sh -s -- -y --profile minimal --default-toolchain stable --target '${{ matrix.target }}'
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - run: scripts/release_bins.sh '${{ matrix.target }}'
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bins-${{ matrix.target }}
-          path: target/dist/*.tar.xz
-          if-no-files-found: error
+    uses: ./.github/workflows/bins.yml
 
   source:
     runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
+      - run: |
+          apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/checkout@v4
+      - run: scripts/release_deps.sh x86_64-unknown-linux-gnu
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: tag matches version
         run: |
           ver=$(sed -n 's/^version = "\(.*\)"$/\1/p;T;q' Cargo.toml)
@@ -68,7 +35,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: source
-          path: target/dist/*.tar.xz
+          path: |
+            target/dist/*.tar.xz
+            target/dist/*.buildinfo
           if-no-files-found: error
 
   release:
@@ -84,10 +53,17 @@ jobs:
         with:
           path: out
           merge-multiple: true
-      - run: cd out && sha256sum -- *.tar.xz > SHA256SUMS
+      - run: cd out && sha256sum -- *.tar.xz *.buildinfo | LC_ALL=C sort -k2 > SHA256SUMS
+      - name: sums match the tag
+        run: |
+          git fetch -q --depth=1 origin "+$GITHUB_REF:$GITHUB_REF"
+          git for-each-ref --format='%(contents)' "$GITHUB_REF" | grep -E '^[0-9a-f]{64}  xara-' > tag-sums
+          diff tag-sums out/SHA256SUMS
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: out/*.tar.xz
+          subject-path: |
+            out/*.tar.xz
+            out/*.buildinfo
       - name: draft release
         env:
           GH_TOKEN: ${{ github.token }}

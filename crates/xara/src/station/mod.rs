@@ -23,11 +23,13 @@ pub(crate) fn secs(t: Time) -> f64 {
 pub struct Options {
     pub drive_db: f64,
     pub tx_latency: Time,
+    pub rx_lag: Time,
+    pub ptt_tail: Time,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { drive_db: DEFAULT_DRIVE_DB, tx_latency: 0 }
+        Self { drive_db: DEFAULT_DRIVE_DB, tx_latency: 0, rx_lag: 0, ptt_tail: 0 }
     }
 }
 
@@ -97,7 +99,7 @@ impl<S: Arq> Common<S> {
         Self {
             session,
             cfg,
-            tx: TxScheduler::new(opts.tx_latency),
+            tx: TxScheduler::new(opts.tx_latency, opts.rx_lag),
             opts,
             listen_on: true,
             listen: None,
@@ -181,10 +183,10 @@ pub trait Modem {
         c.tx.retune(|| Self::tune_tone(db));
     }
 
-    fn set_tx_latency(&mut self, t: Time) {
+    fn set_tx_latency(&mut self, t: Time, lag: Time) {
         let c = self.common_mut();
-        c.opts.tx_latency = t;
-        c.tx.set_latency(t);
+        (c.opts.tx_latency, c.opts.rx_lag) = (t, lag);
+        c.tx.set_latency(t, lag);
     }
 
     fn options(&self) -> &Options {

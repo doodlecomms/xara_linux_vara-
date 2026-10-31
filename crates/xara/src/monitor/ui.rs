@@ -1,7 +1,8 @@
 use super::record::Record;
 use super::{Line, Monitor};
+use crate::lock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
 use xara_arq::kiss;
 use xara_phy::hf::level::Bandwidth;
 use xara_phy::hf::rx::FS;
@@ -110,10 +111,6 @@ pub struct Shared {
 struct Decoded {
     at: f64,
     json: String,
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Shared {

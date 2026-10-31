@@ -4,7 +4,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::ptr::{NonNull, null, null_mut};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::remaining;
 
@@ -78,9 +78,25 @@ pub struct SinkInfo {
 #[cfg(target_pointer_width = "64")]
 #[repr(C)]
 struct TimingInfo {
-    _timestamp: libc::timeval,
+    timestamp: libc::timeval,
     _synchronized_clocks: c_int,
     sink_usec: u64,
+    _source_usec: u64,
+    _transport_usec: u64,
+    playing: c_int,
+    write_index_corrupt: c_int,
+    write_index: i64,
+    read_index_corrupt: c_int,
+    read_index: i64,
+}
+
+pub const RAW_TIMING: bool = cfg!(target_pointer_width = "64");
+
+pub struct Timing {
+    pub at: Duration,
+    pub sink_us: u64,
+    pub playing: bool,
+    pub ahead: i64,
 }
 
 #[repr(C)]
@@ -434,15 +450,19 @@ impl Stream {
     }
 
     #[cfg(target_pointer_width = "64")]
-    pub fn sink_us(&self) -> Option<u64> {
+    pub fn timing(&self) -> Option<Timing> {
         // SAFETY: the stream is live; the result is null or its timing info, read before the next libpulse call.
-        let t = unsafe { pa_stream_get_timing_info(self.raw()) };
-        // SAFETY: a non-null t is valid for this read.
-        (!t.is_null()).then(|| unsafe { (*t).sink_usec })
+        let t = unsafe { pa_stream_get_timing_info(self.raw()).as_ref() }?;
+        if t.write_index_corrupt != 0 || t.read_index_corrupt != 0 {
+            return None;
+        }
+        let at =
+            Duration::new(u64::try_from(t.timestamp.tv_sec).ok()?, u32::try_from(t.timestamp.tv_usec).ok()? * 1000);
+        Some(Timing { at, sink_us: t.sink_usec, playing: t.playing != 0, ahead: t.write_index - t.read_index })
     }
 
     #[cfg(not(target_pointer_width = "64"))]
-    pub fn sink_us(&self) -> Option<u64> {
+    pub fn timing(&self) -> Option<Timing> {
         None
     }
 

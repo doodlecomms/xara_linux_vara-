@@ -37,21 +37,22 @@ pub struct TxScheduler {
     hold_until: Time,
     ptt: bool,
     latency: Time,
+    lag: Time,
     unkey: Option<Unkey>,
     tune: Option<(Vec<f64>, usize)>,
 }
 
 impl TxScheduler {
-    pub fn new(latency: Time) -> Self {
-        Self { latency, ..Self::default() }
+    pub fn new(latency: Time, lag: Time) -> Self {
+        Self { latency, lag, ..Self::default() }
     }
 
     pub fn latency(&self) -> Time {
         self.latency
     }
 
-    pub fn set_latency(&mut self, latency: Time) {
-        self.latency = latency;
+    pub fn set_latency(&mut self, latency: Time, lag: Time) {
+        (self.latency, self.lag) = (latency, lag);
     }
 
     pub fn ptt(&self) -> bool {
@@ -118,11 +119,12 @@ impl TxScheduler {
     }
 
     fn unkey_at(&mut self, end: Time, reports: &mut VecDeque<Report>, mark: usize) {
-        if self.latency == 0 {
+        let hold = self.latency - self.lag;
+        if hold <= 0 {
             self.ptt = false;
             reports.insert(mark, Report::Ptt(false));
         } else {
-            self.unkey = Some(Unkey { at: end + self.latency, ready: mark });
+            self.unkey = Some(Unkey { at: end + hold, ready: mark });
         }
     }
 

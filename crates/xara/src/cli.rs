@@ -9,6 +9,14 @@ where
     v.parse().map_err(|e| format!("{k}: {e}"))
 }
 
+pub fn either(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
 pub fn call(c: &str) -> Result<String, String> {
     xara_host::command::valid_call(c).ok_or_else(|| format!("bad call {c}"))
 }

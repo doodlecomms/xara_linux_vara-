@@ -11,6 +11,7 @@ use xara_phy::hf::level::Bandwidth;
 #[derive(Clone, Copy, Default)]
 struct Lead {
     ms: [i64; 2],
+    lag: [i64; 2],
     told: bool,
 }
 
@@ -22,13 +23,15 @@ fn pair(bw: Bandwidth, registered: bool, noise: f64, lead: Lead) -> Air {
         c.host.registered = registered;
         c
     };
-    let opts = |i: usize| Options { tx_latency: if lead.told { lead.ms[i] * 48 } else { 0 }, ..Options::default() };
+    let told = |i: usize| if lead.told { (lead.ms[i] + lead.lag[i]) * 48 } else { 0 };
+    let opts = |i: usize| Options { tx_latency: told(i), ..Options::default() };
     Air::pair(
         [Station::new(cfg("N0CALL", 3), opts(0)), Station::new(cfg("N1CALL", 5), opts(1))],
         [0, 1].map(|i| 2400 + lead.ms[i] as usize * 48),
         noise,
         |r| matches!(r, Report::Host(HostEvent::Buffer(_) | HostEvent::Sn(_))),
     )
+    .lagged(lead.lag.map(|ms| ms as usize * 48))
 }
 
 fn session(bw: Bandwidth, registered: bool, noise: f64, a_to_b: usize, b_to_a: usize) -> Air {
@@ -132,13 +135,40 @@ fn compressed_sessions_over_audio() {
 fn ptt_lead_is_absorbed() {
     for ms in [[300, 0], [500, 0], [0, 100], [100, 100]] {
         let led = |told| {
-            let lead = Lead { ms, told };
+            let lead = Lead { ms, lag: [0, 0], told };
             session_led(Bandwidth::Hz2300, true, 0.002, payload(8000, 77), payload(1500, 77), Compression::Text, lead)
         };
         let before = led(false);
         assert!(matches!(before, Err(Failure::NoLink(_))), "lead {ms:?} unaware: {:?}", before.map(|a| a.secs()));
         let after = led(true).unwrap_or_else(|e| panic!("lead {ms:?}: {e:?}"));
         assert!(after.top_tx(0) >= 10 && after.secs() < 100.0, "lead {ms:?}: {:.1} s\n{}", after.secs(), after.trace());
+    }
+}
+
+fn median_gap(air: &Air, from: usize, to: usize) -> f64 {
+    let mut g = air.reply_gaps(from, to);
+    assert!(g.len() >= 5, "{from} -> {to}: {g:?}\n{}", air.trace());
+    g.sort_by(f64::total_cmp);
+    g[g.len() / 2]
+}
+
+#[test]
+fn capture_lag_is_absorbed() {
+    let run = |lag, told| {
+        let lead = Lead { ms: [0, 0], lag, told };
+        session_led(Bandwidth::Hz2300, true, 0.002, payload(6000, 77), payload(800, 78), Compression::Text, lead)
+    };
+    let base = run([0, 0], true).unwrap();
+    let want = [median_gap(&base, 1, 0), median_gap(&base, 0, 1)];
+    for (i, ms) in [(0, 40), (1, 40)] {
+        let mut lag = [0, 0];
+        lag[i] = ms;
+        let told = run(lag, true).unwrap_or_else(|e| panic!("lag {lag:?} told: {e:?}"));
+        let got = [median_gap(&told, 1, 0), median_gap(&told, 0, 1)];
+        assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() <= 2.0), "lag {lag:?} told: {got:?} vs {want:?}");
+        let unaware = run(lag, false).unwrap_or_else(|e| panic!("lag {lag:?} unaware: {e:?}"));
+        let late = median_gap(&unaware, 1 - i, i) - want[i];
+        assert!((late - ms as f64).abs() <= 3.0, "lag {lag:?} unaware: {late:+.1} ms late");
     }
 }
 

@@ -334,7 +334,7 @@ impl TxFront for Station {
         self.un.rx.mute(start, heard);
         let mark = self.c.reports.len();
         if kind == Kind::Session {
-            self.c.session.on_tx_done(heard);
+            self.c.session.on_tx_done(heard + self.c.opts.ptt_tail);
             self.drain_at(end);
         }
         self.c.tx.release(end, &mut self.c.reports, mark);

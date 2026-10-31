@@ -2,6 +2,7 @@ use crate::command::{Command, parse};
 use crate::writer::Writer;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -144,9 +145,11 @@ fn wake(mut a: SocketAddr) {
     let _ = TcpStream::connect_timeout(&a, WAKE_TIMEOUT);
 }
 
+#[cfg(target_os = "linux")]
 fn set_reuse(l: &TcpListener, on: bool) -> io::Result<()> {
     let v: libc::c_int = on.into();
     let len = std::mem::size_of_val(&v) as libc::socklen_t;
+    // SAFETY: l is an open socket and v outlives the call.
     let r =
         unsafe { libc::setsockopt(l.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, (&raw const v).cast(), len) };
     if r != 0 {
@@ -155,22 +158,36 @@ fn set_reuse(l: &TcpListener, on: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn pause(l: &TcpListener) -> io::Result<()> {
-    if unsafe { libc::shutdown(l.as_raw_fd(), libc::SHUT_RD) } != 0 {
-        return Err(io::Error::last_os_error());
+#[cfg(target_os = "linux")]
+struct Paused;
+
+#[cfg(target_os = "linux")]
+impl Paused {
+    fn start(l: &TcpListener) -> io::Result<Self> {
+        set_reuse(l, false)?;
+        // SAFETY: l is an open socket; shutdown takes no pointers.
+        if unsafe { libc::shutdown(l.as_raw_fd(), libc::SHUT_RD) } != 0 {
+            let e = io::Error::last_os_error();
+            let _ = set_reuse(l, true);
+            return Err(e);
+        }
+        Ok(Self)
     }
-    set_reuse(l, false)
+
+    fn resume(&mut self, l: &TcpListener) -> io::Result<()> {
+        set_reuse(l, true)?;
+        // SAFETY: l is an open socket; listen takes no pointers.
+        if unsafe { libc::listen(l.as_raw_fd(), 128) } != 0 {
+            let e = io::Error::last_os_error();
+            let _ = set_reuse(l, false);
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
-fn resume(l: &TcpListener) -> io::Result<()> {
-    set_reuse(l, true)?;
-    if unsafe { libc::listen(l.as_raw_fd(), 128) } != 0 {
-        let e = io::Error::last_os_error();
-        let _ = set_reuse(l, false);
-        return Err(e);
-    }
-    Ok(())
-}
+#[cfg(not(target_os = "linux"))]
+use crate::bouncer::Bouncer as Paused;
 
 fn bind_fixed(addr: &str, port: u16) -> io::Result<TcpListener> {
     if port != 0 {
@@ -210,26 +227,32 @@ fn serve(
             if closed() {
                 return;
             }
-            if let Err(e) = pause(&l) {
-                crate::say(format_args!("{name} cannot refuse a second client: {e}"));
-            }
-            if attach(s, port, &clients, &tx, &hold).is_err() || closed() {
+            let paused = Paused::start(&l)
+                .inspect_err(|e| crate::say(format_args!("{name} cannot refuse a second client: {e}")))
+                .ok();
+            let Ok(ended) = attach(s, port, &clients, &tx, &hold) else { return };
+            if closed() {
                 return;
             }
-            if let Err(e) = resume(&l) {
-                crate::say(format_args!("{name} cannot listen again, retrying: {e}"));
-                while !closed() && resume(&l).is_err() {
-                    thread::sleep(ACCEPT_BACKOFF);
+            if let Some(mut p) = paused {
+                if let Err(e) = p.resume(&l) {
+                    crate::say(format_args!("{name} cannot listen again, retrying: {e}"));
+                    while !closed() && p.resume(&l).is_err() {
+                        thread::sleep(ACCEPT_BACKOFF);
+                    }
                 }
+            }
+            if ended && tx.send(Input::Closed).is_err() {
+                return;
             }
         }
     })?;
     Ok(())
 }
 
-fn attach(s: TcpStream, port: Port, clients: &Shared, tx: &SyncSender<Input>, hold: &Hold) -> Result<(), ()> {
+fn attach(s: TcpStream, port: Port, clients: &Shared, tx: &SyncSender<Input>, hold: &Hold) -> Result<bool, ()> {
     let _ = s.set_nodelay(true);
-    let Ok(w) = Writer::spawn(&s) else { return Ok(()) };
+    let Ok(w) = Writer::spawn(&s) else { return Ok(false) };
     *clients.lock().unwrap().slot(port) = Some(w);
     tx.send(Input::Connected).map_err(drop)?;
     match port {
@@ -237,14 +260,13 @@ fn attach(s: TcpStream, port: Port, clients: &Shared, tx: &SyncSender<Input>, ho
         Port::Data => read_data(s, tx, hold),
     }
     let mut c = clients.lock().unwrap();
-    if c.slot(port).is_some() {
+    let ended = c.slot(port).is_some();
+    if ended {
         for w in [c.cmd.take(), c.data.take()].into_iter().flatten() {
             w.close();
         }
-        drop(c);
-        tx.send(Input::Closed).map_err(drop)?;
     }
-    Ok(())
+    Ok(ended)
 }
 
 fn read_commands(mut s: TcpStream, tx: &SyncSender<Input>) {

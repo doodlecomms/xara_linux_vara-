@@ -1,8 +1,10 @@
+use xara::station::fm::Station as FmStation;
 use xara::station::hf::Station;
 use xara::station::{Modem, Options, Report, TX_RING_BYTES};
 use xara_arq::hf::session::{Config, State};
 use xara_arq::kiss::Command;
 use xara_phy::dsp::quantise;
+use xara_phy::fm::level::FmBandwidth;
 use xara_phy::hf::ctrl::{self, Fmt};
 use xara_phy::hf::level::Bandwidth;
 
@@ -37,7 +39,7 @@ fn a_ptt_lead_holds_the_ptt_report_until_the_audio_is_out() {
         let opts = Options { tx_latency: start, ..Options::default() };
         let mut st = Station::new(Config::new(Bandwidth::Hz2300, "N0CALL"), opts);
         if let Some(t) = now {
-            st.set_tx_latency(t);
+            st.set_tx_latency(t, 0);
         }
         assert_eq!(st.options().tx_latency, 4800);
         assert!(st.tune(true));
@@ -49,6 +51,47 @@ fn a_ptt_lead_holds_the_ptt_report_until_the_audio_is_out() {
         assert_eq!(run(&mut st, 1).1, [Report::Ptt(false)]);
         assert!(!st.ptt() && st.idle());
     }
+}
+
+#[test]
+fn the_ptt_drops_when_the_audio_ends_not_a_capture_lag_later() {
+    let opts = Options { tx_latency: 4800, rx_lag: 1000, ..Options::default() };
+    let mut st = Station::new(Config::new(Bandwidth::Hz2300, "N0CALL"), opts);
+    assert!(st.tune(true));
+    assert!(run(&mut st, 4800).1.contains(&Report::Ptt(true)));
+    assert!(st.tune(false));
+    assert!(!run(&mut st, 3800).1.contains(&Report::Ptt(false)) && st.ptt());
+    assert_eq!(run(&mut st, 1).1, [Report::Ptt(false)]);
+    st.set_tx_latency(4800, 4800);
+    assert!(st.tune(true));
+    run(&mut st, 480);
+    assert!(st.tune(false));
+    assert_eq!(run(&mut st, 1).1, [Report::Ptt(false)]);
+}
+
+fn second_call_at<M: Modem>(mut st: M) -> usize {
+    assert!(st.connect("N0CALL", "N1CALL", &[]));
+    let mut keyed = 0;
+    for t in 0..48_000 * 10 {
+        let mut out = [0.0];
+        st.process(&[0.0], &mut out);
+        if std::iter::from_fn(|| st.pop()).any(|r| r == Report::Ptt(true)) {
+            keyed += 1;
+            if keyed == 2 {
+                return t;
+            }
+        }
+    }
+    panic!("no retry");
+}
+
+#[test]
+fn the_reply_window_opens_when_the_ptt_tail_ends() {
+    let opts = |ptt_tail| Options { ptt_tail, ..Options::default() };
+    let hf = |t| Station::new(Config::new(Bandwidth::Hz2300, "N0CALL"), opts(t));
+    assert_eq!(second_call_at(hf(4800)) - second_call_at(hf(0)), 4800);
+    let fm = |t| FmStation::new(xara_arq::fm::Config::new(FmBandwidth::Narrow, "N0CALL"), opts(t));
+    assert_eq!(second_call_at(fm(4800)) - second_call_at(fm(0)), 4800);
 }
 
 #[test]

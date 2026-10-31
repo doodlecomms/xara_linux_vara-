@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for xara on macOS. replace YOU with your login name and check
+  the xara path. settings come from ~/.config/xara/xara.conf. the log is
+  ~/Library/Logs/xara.log; if xara won't start, look in xara.err there. stop
+  the agent with launchctl bootout.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.x0rro.xara</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/YOU/.cargo/bin/xara</string>
+		<string>--config</string>
+		<string>/Users/YOU/.config/xara/xara.conf</string>
+		<string>--state-dir</string>
+		<string>/Users/YOU/Library/Application Support/xara</string>
+		<string>--log</string>
+		<string>/Users/YOU/Library/Logs/xara.log</string>
+		<string>--quiet</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ExitTimeOut</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/YOU/Library/Logs/xara.err</string>
+</dict>
+</plist>

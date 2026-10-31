@@ -82,8 +82,8 @@ impl<M: Modem> Tnc<M> {
         self.keyed
     }
 
-    pub fn set_tx_latency(&mut self, t: Time) {
-        self.station.set_tx_latency(t);
+    pub fn set_tx_latency(&mut self, t: Time, lag: Time) {
+        self.station.set_tx_latency(t, lag);
     }
 
     pub fn set_echo(&mut self, on: bool) {
